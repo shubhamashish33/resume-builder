@@ -1,9 +1,14 @@
-import streamlit as st
-from datetime import date
-from jinja2 import Template
 import base64
 import json
 import os
+import re
+import shutil
+import zlib
+from datetime import date
+
+import streamlit as st
+import streamlit.components.v1 as components
+from jinja2 import Environment
 
 # ─── Page Config ────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Resume Builder", layout="wide")
@@ -16,7 +21,8 @@ DEFAULT_RESUME = {
         "font_family": "Inter",
         "spacing": "normal",
         "ats_mode": False,
-        "section_order": ["summary", "experience", "skills", "projects", "education"]
+        "section_order": ["summary", "experience", "skills", "projects", "education", "certifications", "languages", "volunteering"],
+        "hidden_sections": []
     },
     "personal": {
         "name": "Shubham Ashish",
@@ -112,9 +118,212 @@ DEFAULT_RESUME = {
     "volunteering": []
 }
 
-# ─── Session State Init ──────────────────────────────────────────────────────
+SECTION_LABELS = {
+    "summary": "Summary",
+    "experience": "Experience",
+    "skills": "Skills",
+    "projects": "Projects",
+    "education": "Education",
+    "certifications": "Certifications",
+    "languages": "Languages",
+    "volunteering": "Volunteering",
+}
+
+FONT_OPTIONS = ["Inter", "Georgia", "Roboto", "Lato", "Merriweather", "Poppins", "Source Sans 3"]
+COOKIE_PREFIX = "resume_builder_state_"
+COOKIE_CHUNK_SIZE = 3200
+COOKIE_CHUNK_COUNT = 12
+
+
+def clone_resume(data):
+    return json.loads(json.dumps(data))
+
+
+def normalize_resume(data):
+    resume = clone_resume(DEFAULT_RESUME)
+    if isinstance(data, dict):
+        if isinstance(data.get("meta"), dict):
+            resume["meta"].update(data["meta"])
+        if isinstance(data.get("personal"), dict):
+            resume["personal"].update(data["personal"])
+        for key in ["summary", "experience", "education", "skills", "projects", "certifications", "languages", "volunteering"]:
+            if key in data:
+                resume[key] = data[key]
+
+    order = [sec for sec in resume["meta"].get("section_order", []) if sec in SECTION_LABELS]
+    for sec in SECTION_LABELS:
+        if sec not in order:
+            order.append(sec)
+    resume["meta"]["section_order"] = order
+    resume["meta"]["hidden_sections"] = [sec for sec in resume["meta"].get("hidden_sections", []) if sec in SECTION_LABELS]
+    if resume["meta"]["font_family"] not in FONT_OPTIONS:
+        resume["meta"]["font_family"] = "Inter"
+    if resume["meta"]["template"] not in ["classic", "sidebar", "minimal"]:
+        resume["meta"]["template"] = "classic"
+    if resume["meta"]["spacing"] not in ["compact", "normal", "spacious"]:
+        resume["meta"]["spacing"] = "normal"
+    return resume
+
+
+def encode_resume(resume):
+    payload = json.dumps(resume, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(zlib.compress(payload, 9)).decode("ascii")
+
+
+def decode_resume(blob):
+    data = zlib.decompress(base64.urlsafe_b64decode(blob.encode("ascii")))
+    return normalize_resume(json.loads(data.decode("utf-8")))
+
+
+def load_browser_resume():
+    cookies = getattr(st.context, "cookies", {})
+    chunks = []
+    for index in range(COOKIE_CHUNK_COUNT):
+        value = cookies.get(f"{COOKIE_PREFIX}{index}", "")
+        if not value:
+            break
+        chunks.append(value)
+    if not chunks:
+        return None
+    try:
+        return decode_resume("".join(chunks))
+    except Exception:
+        return None
+
+
+def persist_browser_resume(resume, clear=False):
+    encoded = "" if clear else encode_resume(resume)
+    parts = [encoded[i:i + COOKIE_CHUNK_SIZE] for i in range(0, len(encoded), COOKIE_CHUNK_SIZE)]
+    script = [
+        "<script>",
+        "const root = window.parent.document;",
+        f"const prefix = {json.dumps(COOKIE_PREFIX)};",
+        f"const total = {COOKIE_CHUNK_COUNT};",
+        f"const parts = {json.dumps(parts)};",
+        "for (let i = 0; i < total; i += 1) {",
+        "  if (parts[i]) {",
+        "    root.cookie = `${prefix}${i}=${parts[i]}; path=/; max-age=31536000; SameSite=Lax`;",
+        "  } else {",
+        "    root.cookie = `${prefix}${i}=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax`;",
+        "  }",
+        "}",
+        "</script>",
+    ]
+    components.html("\n".join(script), height=0)
+
+
+def parse_resume_text(text):
+    resume = clone_resume(DEFAULT_RESUME)
+    sections = {"personal": []}
+    current = "personal"
+    for raw_line in text.replace("\r\n", "\n").split("\n"):
+        stripped = raw_line.strip()
+        if stripped.startswith("#"):
+            heading = stripped.lstrip("#").strip().lower()
+            mapping = {
+                "personal": "personal",
+                "personal info": "personal",
+                "summary": "summary",
+                "profile": "summary",
+                "experience": "experience",
+                "work experience": "experience",
+                "skills": "skills",
+                "projects": "projects",
+                "education": "education",
+                "certifications": "certifications",
+                "languages": "languages",
+                "volunteering": "volunteering",
+            }
+            current = mapping.get(heading, current)
+            sections.setdefault(current, [])
+            continue
+        sections.setdefault(current, []).append(raw_line.rstrip())
+
+    for line in sections.get("personal", []):
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().lower()
+        if key in resume["personal"]:
+            resume["personal"][key] = value.strip()
+
+    summary_lines = [line.strip() for line in sections.get("summary", []) if line.strip()]
+    if summary_lines:
+        resume["summary"] = " ".join(summary_lines)
+
+    skills = []
+    for line in sections.get("skills", []):
+        item = line.lstrip("-* ").strip()
+        if not item:
+            continue
+        if ":" in item:
+            category, tags = item.split(":", 1)
+            skills.append({"category": category.strip(), "tags": [x.strip() for x in tags.split(",") if x.strip()]})
+        else:
+            skills.append({"category": "Skills", "tags": [x.strip() for x in item.split(",") if x.strip()]})
+    if skills:
+        resume["skills"] = skills
+
+    experience = []
+    blocks = re.split(r"\n\s*\n", "\n".join(sections.get("experience", [])))
+    for block in blocks:
+        lines = [line.strip() for line in block.split("\n") if line.strip()]
+        if not lines:
+            continue
+        title = lines[0].lstrip("# ").strip()
+        role, company = title, ""
+        if " at " in title:
+            role, company = [x.strip() for x in title.split(" at ", 1)]
+        elif "|" in title:
+            role, company = [x.strip() for x in title.split("|", 1)]
+        bullets = [line.lstrip("-* ").strip() for line in lines[1:] if line.startswith(("-", "*"))]
+        if role or company or bullets:
+            experience.append({"role": role, "company": company, "location": "", "start_date": "", "end_date": "", "current": False, "bullets": bullets})
+    if experience:
+        resume["experience"] = experience
+
+    projects = []
+    blocks = re.split(r"\n\s*\n", "\n".join(sections.get("projects", [])))
+    for block in blocks:
+        lines = [line.strip() for line in block.split("\n") if line.strip()]
+        if not lines:
+            continue
+        name = lines[0].lstrip("# ").strip()
+        bullets = [line.lstrip("-* ").strip() for line in lines[1:] if line.startswith(("-", "*"))]
+        description = next((line for line in lines[1:] if not line.startswith(("-", "*"))), "")
+        projects.append({"name": name, "description": description, "link": "", "tech_stack": [], "bullets": bullets})
+    if projects:
+        resume["projects"] = projects
+
+    return normalize_resume(resume)
+
+
+def import_resume_text(file_name, text):
+    if file_name.lower().endswith(".json"):
+        return normalize_resume(json.loads(text))
+    return parse_resume_text(text)
+
+
+def get_wkhtmltopdf_path():
+    candidates = [
+        shutil.which("wkhtmltopdf"),
+        r"C:\Program Files\wkhtmltopdf\bin\wkhtmltopdf.exe",
+        r"C:\Program Files (x86)\wkhtmltopdf\bin\wkhtmltopdf.exe",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
 if "resume" not in st.session_state:
-    st.session_state.resume = json.loads(json.dumps(DEFAULT_RESUME))
+    st.session_state.resume = load_browser_resume() or clone_resume(DEFAULT_RESUME)
+if "raw_import_text" not in st.session_state:
+    st.session_state.raw_import_text = ""
+if "pdf_bytes" not in st.session_state:
+    st.session_state.pdf_bytes = None
+
+st.session_state.resume = normalize_resume(st.session_state.resume)
 
 # ─── Helper: Format Date ─────────────────────────────────────────────────────
 def fmt_date(iso_str):
@@ -137,327 +346,197 @@ RESUME_HTML = """
 <head>
 <meta charset="utf-8">
 <style>
+  @page { size: A4; margin: 4mm; }
   @import url('https://fonts.googleapis.com/css2?family={{ font_family | replace(' ', '+') }}:wght@300;400;500;600;700&display=swap');
-
   * { margin: 0; padding: 0; box-sizing: border-box; }
-
   body {
     font-family: '{{ font_family }}', sans-serif;
-    font-size: {% if spacing == 'compact' %}12px{% elif spacing == 'spacious' %}14px{% else %}13px{% endif %};
-    color: #1a1a2e;
-    line-height: {% if spacing == 'compact' %}1.4{% elif spacing == 'spacious' %}1.8{% else %}1.6{% endif %};
-    padding: {% if spacing == 'compact' %}28px 36px{% elif spacing == 'spacious' %}44px 52px{% else %}36px 44px{% endif %};
-  }
-
-  /* ── Header ── */
-  .header { margin-bottom: 14px; }
-  .header h1 {
-    font-size: 26px;
-    font-weight: 700;
+    font-size: {% if spacing == 'compact' %}11.5px{% elif spacing == 'spacious' %}13.5px{% else %}12.5px{% endif %};
+    line-height: {% if spacing == 'compact' %}1.45{% elif spacing == 'spacious' %}1.75{% else %}1.6{% endif %};
     color: #0f172a;
-    letter-spacing: -0.3px;
-  }
-  .header .title {
-    font-size: 14px;
-    color: {{ accent_color }};
-    font-weight: 500;
-    margin-top: 2px;
-  }
-  .contact-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px 18px;
-    margin-top: 8px;
-    font-size: 12px;
-    color: #475569;
-  }
-  .contact-row a { color: #475569; text-decoration: none; }
-  .contact-row span::before { content: ""; }
-
-  /* ── Divider ── */
-  .section-divider {
-    border: none;
-    border-top: 1.5px solid {{ accent_color }};
-    margin: 12px 0 8px 0;
-    opacity: 0.25;
-  }
-
-  /* ── Section ── */
-  .section { margin-bottom: {% if spacing == 'compact' %}10px{% elif spacing == 'spacious' %}20px{% else %}14px{% endif %}; }
-  .section-title {
-    font-size: 11px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 1.2px;
-    color: {{ accent_color }};
-    margin-bottom: 6px;
-    padding-bottom: 3px;
-    border-bottom: 1.5px solid {{ accent_color }};
-  }
-
-  /* ── Experience / Project Entry ── */
-  .entry { margin-bottom: {% if spacing == 'compact' %}7px{% elif spacing == 'spacious' %}14px{% else %}10px{% endif %}; }
-  .entry-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-  }
-  .entry-title {
-    font-size: 13px;
-    font-weight: 600;
-    color: #0f172a;
-  }
-  .entry-date {
-    font-size: 11px;
-    color: #64748b;
-    white-space: nowrap;
-  }
-  .entry-sub {
-    font-size: 12px;
-    color: #475569;
-    margin-top: 1px;
-  }
-  .entry-sub .company { font-weight: 500; }
-
-  /* ── Bullets ── */
-  ul.bullets {
-    margin: 4px 0 0 14px;
+    background: #ffffff;
     padding: 0;
   }
-  ul.bullets li {
-    font-size: 12px;
-    color: #334155;
-    margin-bottom: 2px;
-    line-height: 1.5;
+  .resume-shell {
+    max-width: 100%;
+    margin: 0 auto;
+    background: #fff;
+    border-radius: 0;
+    box-shadow: none;
+    border-top: {% if template == 'minimal' and not ats_mode %}7px solid {{ accent_color }}{% else %}none{% endif %};
+    padding: {% if spacing == 'compact' %}14px 16px{% elif spacing == 'spacious' %}24px 26px{% else %}18px 20px{% endif %};
   }
-
-  /* ── Skills ── */
-  .skills-grid { display: flex; flex-direction: column; gap: 3px; }
-  .skill-row { display: flex; gap: 6px; font-size: 12px; }
-  .skill-cat { font-weight: 600; color: #0f172a; min-width: 90px; }
-  .skill-items { color: #334155; }
-
-  /* ── Education ── */
-  .edu-entry { margin-bottom: 6px; }
-
-  /* ── Tech tags ── */
-  .tech-stack { margin-top: 3px; display: flex; flex-wrap: wrap; gap: 4px; }
-  .tech-tag {
-    background: #f1f5f9;
+  .header { margin-bottom: 18px; {% if template == 'minimal' %}padding-bottom:18px;border-bottom:1px solid rgba(15,23,42,0.08);{% endif %} }
+  .header-top { display: flex; justify-content: space-between; gap: 20px; align-items: flex-start; }
+  h1 { font-size: {% if template == 'minimal' %}34px{% else %}30px{% endif %}; line-height: 1; letter-spacing: -0.03em; }
+  .title { margin-top: 6px; color: {% if ats_mode %}#0f172a{% else %}{{ accent_color }}{% endif %}; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; font-size: 13px; }
+  .contact-row { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px 10px; max-width: {% if template == 'sidebar' %}44%{% else %}48%{% endif %}; }
+  .contact-row span, .contact-row a {
     color: #475569;
-    font-size: 10px;
-    padding: 1px 7px;
-    border-radius: 3px;
-    font-weight: 500;
+    text-decoration: none;
+    font-size: 11px;
+    {% if not ats_mode %}background: #f8fafc; border-radius: 999px; padding: 6px 10px;{% endif %}
   }
-
-  /* ── ATS overrides ── */
+  .layout { {% if template == 'sidebar' and not ats_mode %}display:grid;grid-template-columns:minmax(0,1.85fr) minmax(220px,.95fr);gap:24px;{% endif %} }
+  .sidebar { {% if template == 'sidebar' and not ats_mode %}background: rgba(37,99,235,0.05);border:1px solid rgba(37,99,235,0.12);border-radius:18px;padding:18px;{% endif %} }
+  .section { margin-bottom: {% if spacing == 'compact' %}10px{% elif spacing == 'spacious' %}18px{% else %}13px{% endif %}; break-inside: avoid; page-break-inside: avoid; }
+  .section-title {
+    font-size: {% if template == 'minimal' %}12px{% else %}11px{% endif %};
+    color: {% if ats_mode %}#0f172a{% else %}{{ accent_color }}{% endif %};
+    text-transform: uppercase;
+    font-weight: 800;
+    letter-spacing: {% if template == 'minimal' %}0.18em{% else %}0.14em{% endif %};
+    margin-bottom: 8px;
+    {% if template != 'minimal' %}padding-bottom: 5px; border-bottom: 1px solid rgba(37,99,235,0.18);{% endif %}
+  }
+  .entry { margin-bottom: 12px; }
+  .entry-header { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
+  .entry-title { font-size: 13px; font-weight: 700; }
+  .entry-sub, .entry-desc { color: #475569; margin-top: 3px; }
+  .entry-date { color: #64748b; font-size: 11px; white-space: nowrap; }
+  ul.bullets { margin: 7px 0 0 18px; color: #334155; }
+  ul.bullets li { margin-bottom: 3px; }
+  .skills-grid { display: grid; gap: 8px; }
+  .skill-row { display:grid; grid-template-columns:minmax(120px,150px) 1fr; gap: 14px; align-items: start; }
+  .skill-cat { font-weight: 700; }
+  .skill-items { color: #334155; }
+  .tech-stack { margin-top: 6px; display:flex; flex-wrap:wrap; gap:6px; }
+  .tech-tag {
+    {% if ats_mode %}padding:0;background:none;color:#334155;{% else %}padding:4px 9px;background:rgba(37,99,235,0.08);color:{{ accent_color }};border-radius:999px;{% endif %}
+    font-size: 10px;
+    font-weight: 700;
+  }
   {% if ats_mode %}
-  .tech-tag { background: none; padding: 0; }
   .tech-tag::after { content: ", "; }
   .tech-tag:last-child::after { content: ""; }
   {% endif %}
-
-  /* ── Summary ── */
-  .summary-text { font-size: 12.5px; color: #334155; line-height: 1.65; }
 </style>
 </head>
 <body>
-
-<!-- HEADER -->
-<div class="header">
-  <h1>{{ personal.name }}</h1>
-  {% if personal.title %}<div class="title">{{ personal.title }}</div>{% endif %}
-  <div class="contact-row">
-    {% if personal.location %}<span>📍 {{ personal.location }}</span>{% endif %}
-    {% if personal.email %}<span><a href="mailto:{{ personal.email }}">{{ personal.email }}</a></span>{% endif %}
-    {% if personal.phone %}<span>{{ personal.phone }}</span>{% endif %}
-    {% if personal.linkedin %}<span><a href="{{ personal.linkedin }}">LinkedIn ↗</a></span>{% endif %}
-    {% if personal.github %}<span><a href="{{ personal.github }}">Github ↗</a></span>{% endif %}
-    {% if personal.website %}<span><a href="{{ personal.website }}">{{ personal.website }}</a></span>{% endif %}
+<div class="resume-shell">
+  <div class="header">
+    <div class="header-top">
+      <div>
+        <h1>{{ personal.name }}</h1>
+        {% if personal.title %}<div class="title">{{ personal.title }}</div>{% endif %}
+      </div>
+      <div class="contact-row">
+        {% if personal.location %}<span>{{ personal.location }}</span>{% endif %}
+        {% if personal.email %}<a href="mailto:{{ personal.email }}">{{ personal.email }}</a>{% endif %}
+        {% if personal.phone %}<span>{{ personal.phone }}</span>{% endif %}
+        {% if personal.linkedin %}<a href="{{ personal.linkedin }}">LinkedIn</a>{% endif %}
+        {% if personal.github %}<a href="{{ personal.github }}">GitHub</a>{% endif %}
+        {% if personal.website %}<a href="{{ personal.website }}">{{ personal.website }}</a>{% endif %}
+      </div>
+    </div>
   </div>
+  {% if template == 'sidebar' and not ats_mode %}
+  <div class="layout">
+    <div>
+      {% for section in main_sections %}{{ section | safe }}{% endfor %}
+    </div>
+    <div class="sidebar">
+      {% for section in side_sections %}{{ section | safe }}{% endfor %}
+    </div>
+  </div>
+  {% else %}
+  <div>{% for section in flat_sections %}{{ section | safe }}{% endfor %}</div>
+  {% endif %}
 </div>
-
-{% for section in section_order %}
-
-  {% if section == 'summary' and summary %}
-  <div class="section">
-    <div class="section-title">Summary</div>
-    <p class="summary-text">{{ summary }}</p>
-  </div>
-  {% endif %}
-
-  {% if section == 'experience' and experience %}
-  <div class="section">
-    <div class="section-title">Professional Experience</div>
-    {% for exp in experience %}
-    <div class="entry">
-      <div class="entry-header">
-        <div class="entry-title">{{ exp.company }}</div>
-        <div class="entry-date">
-          {{ exp.start_date | fmt_date }}{% if exp.current %} – Present{% elif exp.end_date %} – {{ exp.end_date | fmt_date }}{% endif %}
-        </div>
-      </div>
-      <div class="entry-sub">
-        <span class="company">{{ exp.role }}</span>
-        {% if exp.location %} · {{ exp.location }}{% endif %}
-      </div>
-      {% if exp.bullets %}
-      <ul class="bullets">
-        {% for b in exp.bullets %}<li>{{ b }}</li>{% endfor %}
-      </ul>
-      {% endif %}
-    </div>
-    {% endfor %}
-  </div>
-  {% endif %}
-
-  {% if section == 'skills' and skills %}
-  <div class="section">
-    <div class="section-title">Skills</div>
-    <div class="skills-grid">
-      {% for s in skills %}
-      <div class="skill-row">
-        <span class="skill-cat">{{ s.category }} —</span>
-        <span class="skill-items">{{ s.tags | join(', ') }}</span>
-      </div>
-      {% endfor %}
-    </div>
-  </div>
-  {% endif %}
-
-  {% if section == 'projects' and projects %}
-  <div class="section">
-    <div class="section-title">Technical Projects</div>
-    {% for p in projects %}
-    <div class="entry">
-      <div class="entry-header">
-        <div class="entry-title">{{ p.name }}</div>
-      </div>
-      {% if p.tech_stack %}
-      <div class="tech-stack">
-        {% for t in p.tech_stack %}<span class="tech-tag">{{ t }}</span>{% endfor %}
-      </div>
-      {% endif %}
-      {% if p.bullets %}
-      <ul class="bullets">
-        {% for b in p.bullets %}<li>{{ b }}</li>{% endfor %}
-      </ul>
-      {% endif %}
-    </div>
-    {% endfor %}
-  </div>
-  {% endif %}
-
-  {% if section == 'education' and education %}
-  <div class="section">
-    <div class="section-title">Education</div>
-    {% for edu in education %}
-    <div class="edu-entry">
-      <div class="entry-header">
-        <div class="entry-title">{{ edu.degree }}{% if edu.field %} in {{ edu.field }}{% endif %}</div>
-        <div class="entry-date">
-          {{ edu.start_date | fmt_date }}{% if edu.current %} – Present{% elif edu.end_date %} – {{ edu.end_date | fmt_date }}{% endif %}
-        </div>
-      </div>
-      <div class="entry-sub">
-        {{ edu.institution }}{% if edu.grade %} · {{ edu.grade }}{% endif %}
-      </div>
-    </div>
-    {% endfor %}
-  </div>
-  {% endif %}
-
-  {% if section == 'certifications' and certifications %}
-  <div class="section">
-    <div class="section-title">Certifications</div>
-    {% for c in certifications %}
-    <div class="entry">
-      <div class="entry-header">
-        <div class="entry-title">{{ c.name }}</div>
-        <div class="entry-date">{{ c.date }}</div>
-      </div>
-      {% if c.issuer %}<div class="entry-sub">{{ c.issuer }}</div>{% endif %}
-    </div>
-    {% endfor %}
-  </div>
-  {% endif %}
-
-  {% if section == 'languages' and languages %}
-  <div class="section">
-    <div class="section-title">Languages</div>
-    <div class="skills-grid">
-      {% for l in languages %}
-      <div class="skill-row">
-        <span class="skill-cat">{{ l.language }}</span>
-        <span class="skill-items">{{ l.proficiency }}</span>
-      </div>
-      {% endfor %}
-    </div>
-  </div>
-  {% endif %}
-
-  {% if section == 'volunteering' and volunteering %}
-  <div class="section">
-    <div class="section-title">Volunteering</div>
-    {% for v in volunteering %}
-    <div class="entry">
-      <div class="entry-header">
-        <div class="entry-title">{{ v.role }} — {{ v.org }}</div>
-        <div class="entry-date">{{ v.date }}</div>
-      </div>
-      {% if v.description %}<div class="entry-sub">{{ v.description }}</div>{% endif %}
-    </div>
-    {% endfor %}
-  </div>
-  {% endif %}
-
-{% endfor %}
-
 </body>
 </html>
 """
 
-# ─── Render HTML ─────────────────────────────────────────────────────────────
+
 def render_html(resume):
-    from jinja2 import Environment
     env = Environment()
     env.filters["fmt_date"] = fmt_date
-    tmpl = env.from_string(RESUME_HTML)
     meta = resume["meta"]
-    return tmpl.render(
+    sections = []
+    for section in meta["section_order"]:
+        if section in meta.get("hidden_sections", []):
+            continue
+        block = ""
+        if section == "summary" and resume["summary"]:
+            block = f'<div class="section"><div class="section-title">Summary</div><p>{resume["summary"]}</p></div>'
+        elif section == "experience" and resume["experience"]:
+            items = []
+            for exp in resume["experience"]:
+                date_text = fmt_date(exp["start_date"])
+                if exp.get("current"):
+                    date_text = f"{date_text} - Present" if date_text else "Present"
+                elif exp.get("end_date"):
+                    date_text = f"{date_text} - {fmt_date(exp['end_date'])}" if date_text else fmt_date(exp["end_date"])
+                bullets = "".join(f"<li>{b}</li>" for b in exp.get("bullets", []))
+                items.append(f'<div class="entry"><div class="entry-header"><div><div class="entry-title">{exp.get("role","")}</div><div class="entry-sub">{exp.get("company","")}{(" · " + exp.get("location","")) if exp.get("location") else ""}</div></div><div class="entry-date">{date_text}</div></div>{"<ul class=\"bullets\">" + bullets + "</ul>" if bullets else ""}</div>')
+            block = f'<div class="section"><div class="section-title">Work Experience</div>{"".join(items)}</div>'
+        elif section == "skills" and resume["skills"]:
+            items = "".join(f'<div class="skill-row"><span class="skill-cat">{s.get("category","")}</span><span class="skill-items">{", ".join(s.get("tags", []))}</span></div>' for s in resume["skills"])
+            block = f'<div class="section"><div class="section-title">Skills</div><div class="skills-grid">{items}</div></div>'
+        elif section == "projects" and resume["projects"]:
+            items = []
+            for proj in resume["projects"]:
+                tags = "".join(f'<span class="tech-tag">{tag}</span>' for tag in proj.get("tech_stack", []))
+                bullets = "".join(f"<li>{b}</li>" for b in proj.get("bullets", []))
+                desc = f'<div class="entry-desc">{proj.get("description","")}</div>' if proj.get("description") else ""
+                items.append(f'<div class="entry"><div class="entry-title">{proj.get("name","")}</div>{desc}{"<div class=\"tech-stack\">" + tags + "</div>" if tags else ""}{"<ul class=\"bullets\">" + bullets + "</ul>" if bullets else ""}</div>')
+            block = f'<div class="section"><div class="section-title">Projects</div>{"".join(items)}</div>'
+        elif section == "education" and resume["education"]:
+            items = []
+            for edu in resume["education"]:
+                date_text = fmt_date(edu["start_date"])
+                if edu.get("current"):
+                    date_text = f"{date_text} - Present" if date_text else "Present"
+                elif edu.get("end_date"):
+                    date_text = f"{date_text} - {fmt_date(edu['end_date'])}" if date_text else fmt_date(edu["end_date"])
+                detail = " · ".join([part for part in [edu.get("institution", ""), edu.get("grade", "")] if part])
+                items.append(f'<div class="entry"><div class="entry-header"><div class="entry-title">{edu.get("degree","")}{(" in " + edu.get("field","")) if edu.get("field") else ""}</div><div class="entry-date">{date_text}</div></div><div class="entry-sub">{detail}</div></div>')
+            block = f'<div class="section"><div class="section-title">Education</div>{"".join(items)}</div>'
+        elif section == "certifications" and resume["certifications"]:
+            items = "".join(f'<div class="entry"><div class="entry-title">{c.get("name","")}</div><div class="entry-sub">{" · ".join([part for part in [c.get("issuer",""), c.get("date","")] if part])}</div></div>' for c in resume["certifications"])
+            block = f'<div class="section"><div class="section-title">Certifications</div>{items}</div>'
+        elif section == "languages" and resume["languages"]:
+            items = "".join(f'<div class="skill-row"><span class="skill-cat">{l.get("language","")}</span><span class="skill-items">{l.get("proficiency","")}</span></div>' for l in resume["languages"])
+            block = f'<div class="section"><div class="section-title">Languages</div><div class="skills-grid">{items}</div></div>'
+        elif section == "volunteering" and resume["volunteering"]:
+            items = "".join(f'<div class="entry"><div class="entry-title">{v.get("role","")}{(" - " + v.get("org","")) if v.get("org") else ""}</div><div class="entry-sub">{" · ".join([part for part in [v.get("date",""), v.get("description","")] if part])}</div></div>' for v in resume["volunteering"])
+            block = f'<div class="section"><div class="section-title">Volunteering</div>{items}</div>'
+        if block:
+            sections.append((section, block))
+
+    sidebar_keys = {"skills", "education", "certifications", "languages", "volunteering"}
+    flat_sections = [html for _, html in sections]
+    main_sections = [html for key, html in sections if key not in sidebar_keys]
+    side_sections = [html for key, html in sections if key in sidebar_keys]
+    return env.from_string(RESUME_HTML).render(
         personal=resume["personal"],
-        summary=resume["summary"],
-        experience=resume["experience"],
-        education=resume["education"],
-        skills=resume["skills"],
-        projects=resume["projects"],
-        certifications=resume["certifications"],
-        languages=resume["languages"],
-        volunteering=resume["volunteering"],
-        section_order=meta["section_order"],
         accent_color=meta["accent_color"],
         font_family=meta["font_family"],
         spacing=meta["spacing"],
-        ats_mode=meta["ats_mode"]
+        ats_mode=meta["ats_mode"],
+        template=meta["template"],
+        flat_sections=flat_sections,
+        main_sections=main_sections,
+        side_sections=side_sections,
     )
 
 # ─── Generate PDF ─────────────────────────────────────────────────────────────
 def generate_pdf(html_content):
     import pdfkit
 
-    config = pdfkit.configuration(
-        wkhtmltopdf=r"C:\Program Files\wkhtmltopdf\bin\wkhtmltopdf.exe"
-    )
+    wkhtmltopdf = get_wkhtmltopdf_path()
+    if not wkhtmltopdf:
+        raise RuntimeError("wkhtmltopdf was not found on this machine.")
+    config = pdfkit.configuration(wkhtmltopdf=wkhtmltopdf)
 
     options = {
         "page-size": "A4",
         "encoding": "UTF-8",
         "enable-local-file-access": "",
-        "margin-top": "0mm",
-        "margin-bottom": "0mm",
-        "margin-left": "0mm",
-        "margin-right": "0mm",
+        "margin-top": "3mm",
+        "margin-bottom": "3mm",
+        "margin-left": "3mm",
+        "margin-right": "3mm",
         "disable-smart-shrinking": "",
         "zoom": "1.0"
     }
@@ -468,235 +547,223 @@ def generate_pdf(html_content):
 #  UI
 # ════════════════════════════════════════════════════════════════════════════
 
-st.title("📄 Resume Builder")
-
-left_col, right_col = st.columns([1, 1])
+st.markdown("""
+<style>
+.stApp { background: radial-gradient(circle at top left, rgba(37,99,235,.12), transparent 30%), linear-gradient(180deg, #f8fbff 0%, #eef4ff 100%); }
+.hero-card { background: rgba(255,255,255,.82); border: 1px solid rgba(148,163,184,.2); border-radius: 22px; padding: 18px 20px; box-shadow: 0 18px 50px rgba(15,23,42,.08); margin-bottom: 14px; }
+.hero-card h1 { font-size: 2rem; line-height: 1.05; margin-bottom: 6px; }
+.hero-card p { color: #475569; margin-bottom: 0; }
+</style>
+""", unsafe_allow_html=True)
 
 r = st.session_state.resume
+persist_browser_resume(r)
 
-# ══════════════════════════════
-#  LEFT COLUMN — EDITOR
-# ══════════════════════════════
+visible_sections = [sec for sec in r["meta"]["section_order"] if sec not in r["meta"].get("hidden_sections", [])]
+completion = sum([
+    bool(r["personal"]["name"]),
+    bool(r["personal"]["email"]),
+    bool(r["personal"]["title"]),
+    bool(r["summary"]),
+    bool(r["experience"]),
+    bool(r["skills"]),
+    bool(r["education"]),
+    bool(r["projects"]),
+]) * 100 // 8
+
+st.markdown(f"""
+<div class="hero-card">
+  <h1>Resume Builder</h1>
+  <p>Import markdown or text, edit everything in-place, choose a distinct template, and export print-ready PDFs with a live preview.</p>
+  <p style="margin-top:10px;"><strong>{completion}% complete</strong> · <strong>{len(visible_sections)}</strong> visible sections · autosaves in this browser</p>
+</div>
+""", unsafe_allow_html=True)
+
+left_col, right_col = st.columns([1.05, 0.95], gap="large")
+
 with left_col:
+    import_tab, edit_tab, customize_tab = st.tabs(["Import", "Content", "Customize"])
 
-    # ── Customization Bar ──────────────────────────────────────────────────
-    with st.expander("🎨 Customization", expanded=False):
+    with import_tab:
+        st.subheader("Import Resume")
+        uploaded = st.file_uploader("Upload JSON, Markdown, or text", type=["json", "md", "markdown", "txt"])
+        if uploaded is not None:
+            uploaded_text = uploaded.read().decode("utf-8", errors="ignore")
+            if st.button("Import Uploaded File", use_container_width=True):
+                st.session_state.resume = import_resume_text(uploaded.name, uploaded_text)
+                st.session_state.raw_import_text = uploaded_text
+                st.session_state.pdf_bytes = None
+                st.rerun()
+
+        st.text_area("Paste markdown or plain text", key="raw_import_text", height=220, placeholder="# Summary\nBrief overview here...")
+        ic1, ic2, ic3 = st.columns(3)
+        if ic1.button("Import Pasted Text", use_container_width=True):
+            st.session_state.resume = parse_resume_text(st.session_state.raw_import_text)
+            st.session_state.pdf_bytes = None
+            st.rerun()
+        if ic2.button("Reset to Default", use_container_width=True):
+            st.session_state.resume = clone_resume(DEFAULT_RESUME)
+            st.session_state.pdf_bytes = None
+            st.rerun()
+        if ic3.button("Clear Browser Draft", use_container_width=True):
+            persist_browser_resume(r, clear=True)
+            st.success("Browser draft cleared.")
+        st.download_button("Download JSON Backup", data=json.dumps(r, indent=2), file_name="resume.json", mime="application/json", use_container_width=True)
+
+    with edit_tab:
+        with st.expander("Personal Info", expanded=True):
+            p = r["personal"]
+            p["name"] = st.text_input("Full Name", value=p["name"], key="p_name")
+            p["title"] = st.text_input("Professional Title", value=p["title"], key="p_title")
+            c1, c2 = st.columns(2)
+            p["email"] = c1.text_input("Email", value=p["email"], key="p_email")
+            p["phone"] = c2.text_input("Phone", value=p["phone"], key="p_phone")
+            p["location"] = st.text_input("Location", value=p["location"], key="p_location")
+            c3, c4 = st.columns(2)
+            p["linkedin"] = c3.text_input("LinkedIn URL", value=p["linkedin"], key="p_linkedin")
+            p["github"] = c4.text_input("GitHub URL", value=p["github"], key="p_github")
+            p["website"] = st.text_input("Website", value=p["website"], key="p_website")
+
+        with st.expander("Summary", expanded=True):
+            r["summary"] = st.text_area("Professional Summary", value=r["summary"], key="summary", height=140)
+
+        with st.expander("Experience", expanded=False):
+            for i, exp in enumerate(r["experience"]):
+                st.markdown(f"**Entry {i+1}**")
+                exp["role"] = st.text_input("Role", value=exp["role"], key=f"exp_{i}_role")
+                exp["company"] = st.text_input("Company", value=exp["company"], key=f"exp_{i}_company")
+                exp["location"] = st.text_input("Location", value=exp["location"], key=f"exp_{i}_location")
+                exp["start_date"] = date_input_field("Start Date", f"exp_{i}_start", exp["start_date"])
+                exp["current"] = st.checkbox("Current Role", value=exp["current"], key=f"exp_{i}_current")
+                exp["end_date"] = "" if exp["current"] else date_input_field("End Date", f"exp_{i}_end", exp["end_date"] or exp["start_date"])
+                bullets_text = st.text_area("Bullets", value="\n".join(exp["bullets"]), key=f"exp_{i}_bullets", height=140)
+                exp["bullets"] = [line.strip() for line in bullets_text.split("\n") if line.strip()]
+                if st.button("Remove Experience", key=f"exp_remove_{i}", use_container_width=True):
+                    r["experience"].pop(i); st.rerun()
+                st.markdown("---")
+            if st.button("Add Experience", use_container_width=True):
+                r["experience"].append({"role":"","company":"","location":"","start_date":"","end_date":"","current":False,"bullets":[]}); st.rerun()
+
+        with st.expander("Skills", expanded=False):
+            for i, sk in enumerate(r["skills"]):
+                c1, c2 = st.columns([1, 2])
+                sk["category"] = c1.text_input("Category", value=sk["category"], key=f"sk_{i}_cat")
+                tag_text = c2.text_input("Tags", value=", ".join(sk.get("tags", [])), key=f"sk_{i}_tags")
+                sk["tags"] = [x.strip() for x in tag_text.split(",") if x.strip()]
+                if st.button("Remove Skill Group", key=f"sk_remove_{i}", use_container_width=True):
+                    r["skills"].pop(i); st.rerun()
+            if st.button("Add Skill Group", use_container_width=True):
+                r["skills"].append({"category":"","tags":[]}); st.rerun()
+
+        with st.expander("Projects", expanded=False):
+            for i, proj in enumerate(r["projects"]):
+                proj["name"] = st.text_input("Project Name", value=proj["name"], key=f"pr_{i}_name")
+                proj["description"] = st.text_area("Description", value=proj["description"], key=f"pr_{i}_desc", height=80)
+                proj["link"] = st.text_input("Link", value=proj["link"], key=f"pr_{i}_link")
+                tech_text = st.text_input("Tech Stack", value=", ".join(proj["tech_stack"]), key=f"pr_{i}_tech")
+                proj["tech_stack"] = [x.strip() for x in tech_text.split(",") if x.strip()]
+                bullets_text = st.text_area("Bullets", value="\n".join(proj["bullets"]), key=f"pr_{i}_bullets", height=120)
+                proj["bullets"] = [line.strip() for line in bullets_text.split("\n") if line.strip()]
+                if st.button("Remove Project", key=f"pr_remove_{i}", use_container_width=True):
+                    r["projects"].pop(i); st.rerun()
+                st.markdown("---")
+            if st.button("Add Project", use_container_width=True):
+                r["projects"].append({"name":"","description":"","link":"","tech_stack":[],"bullets":[]}); st.rerun()
+
+        with st.expander("Education", expanded=False):
+            for i, edu in enumerate(r["education"]):
+                edu["institution"] = st.text_input("Institution", value=edu["institution"], key=f"edu_{i}_inst")
+                edu["degree"] = st.text_input("Degree", value=edu["degree"], key=f"edu_{i}_deg")
+                edu["field"] = st.text_input("Field", value=edu["field"], key=f"edu_{i}_field")
+                edu["grade"] = st.text_input("Grade / GPA", value=edu["grade"], key=f"edu_{i}_grade")
+                edu["start_date"] = date_input_field("Start Date", f"edu_{i}_start", edu["start_date"])
+                edu["current"] = st.checkbox("Current Study", value=edu["current"], key=f"edu_{i}_current")
+                edu["end_date"] = "" if edu["current"] else date_input_field("End Date", f"edu_{i}_end", edu["end_date"] or edu["start_date"])
+                if st.button("Remove Education", key=f"edu_remove_{i}", use_container_width=True):
+                    r["education"].pop(i); st.rerun()
+                st.markdown("---")
+            if st.button("Add Education", use_container_width=True):
+                r["education"].append({"institution":"","degree":"","field":"","grade":"","start_date":"","end_date":"","current":False}); st.rerun()
+
+        opt1, opt2, opt3 = st.tabs(["Certifications", "Languages", "Volunteering"])
+        with opt1:
+            for i, cert in enumerate(r["certifications"]):
+                cert["name"] = st.text_input("Certification", value=cert["name"], key=f"cert_{i}_name")
+                cert["issuer"] = st.text_input("Issuer", value=cert["issuer"], key=f"cert_{i}_issuer")
+                cert["date"] = st.text_input("Date", value=cert["date"], key=f"cert_{i}_date")
+                if st.button("Remove Certification", key=f"cert_remove_{i}", use_container_width=True):
+                    r["certifications"].pop(i); st.rerun()
+            if st.button("Add Certification", use_container_width=True):
+                r["certifications"].append({"name":"","issuer":"","date":""}); st.rerun()
+        with opt2:
+            for i, lang in enumerate(r["languages"]):
+                c1, c2 = st.columns(2)
+                lang["language"] = c1.text_input("Language", value=lang["language"], key=f"lang_{i}_language")
+                lang["proficiency"] = c2.text_input("Proficiency", value=lang["proficiency"], key=f"lang_{i}_prof")
+                if st.button("Remove Language", key=f"lang_remove_{i}", use_container_width=True):
+                    r["languages"].pop(i); st.rerun()
+            if st.button("Add Language", use_container_width=True):
+                r["languages"].append({"language":"","proficiency":""}); st.rerun()
+        with opt3:
+            for i, vol in enumerate(r["volunteering"]):
+                vol["org"] = st.text_input("Organization", value=vol["org"], key=f"vol_{i}_org")
+                vol["role"] = st.text_input("Role", value=vol["role"], key=f"vol_{i}_role")
+                vol["date"] = st.text_input("Date", value=vol["date"], key=f"vol_{i}_date")
+                vol["description"] = st.text_area("Description", value=vol["description"], key=f"vol_{i}_desc", height=90)
+                if st.button("Remove Volunteering", key=f"vol_remove_{i}", use_container_width=True):
+                    r["volunteering"].pop(i); st.rerun()
+            if st.button("Add Volunteering", use_container_width=True):
+                r["volunteering"].append({"org":"","role":"","date":"","description":""}); st.rerun()
+
+    with customize_tab:
         meta = r["meta"]
-        meta["accent_color"] = st.color_picker("Accent Color", value=meta["accent_color"], key="meta_color")
-        meta["font_family"]  = st.selectbox("Font", ["Inter", "Georgia", "Roboto", "Lato", "Merriweather"], key="meta_font",
-                                             index=["Inter", "Georgia", "Roboto", "Lato", "Merriweather"].index(meta["font_family"]))
-        meta["spacing"]      = st.select_slider("Spacing", options=["compact", "normal", "spacious"], value=meta["spacing"], key="meta_spacing")
-        meta["ats_mode"]     = st.checkbox("ATS Friendly Mode", value=meta["ats_mode"], key="meta_ats")
-
-        st.markdown("**Section Order** (edit the list to reorder)")
-        all_sections = ["summary", "experience", "skills", "projects", "education", "certifications", "languages", "volunteering"]
+        meta["template"] = st.radio("Template", ["classic", "sidebar", "minimal"], horizontal=True, index=["classic", "sidebar", "minimal"].index(meta["template"]))
+        meta["accent_color"] = st.color_picker("Accent Color", value=meta["accent_color"])
+        meta["font_family"] = st.selectbox("Font Family", FONT_OPTIONS, index=FONT_OPTIONS.index(meta["font_family"]))
+        meta["spacing"] = st.select_slider("Density", options=["compact", "normal", "spacious"], value=meta["spacing"])
+        meta["ats_mode"] = st.toggle("ATS-friendly mode", value=meta["ats_mode"])
+        st.markdown("**Section Visibility & Order**")
         for idx, sec in enumerate(meta["section_order"]):
-            c1, c2, c3 = st.columns([3, 1, 1])
-            c1.markdown(f"`{sec}`")
-            if c2.button("▲", key=f"ord_up_{idx}") and idx > 0:
-                meta["section_order"][idx], meta["section_order"][idx-1] = meta["section_order"][idx-1], meta["section_order"][idx]
+            c1, c2, c3, c4 = st.columns([2.2, 1, 1, 1])
+            c1.markdown(f"**{SECTION_LABELS[sec]}**")
+            visible = c2.checkbox("Show", value=sec not in meta.get("hidden_sections", []), key=f"show_{sec}")
+            if visible and sec in meta["hidden_sections"]:
+                meta["hidden_sections"].remove(sec)
+            if not visible and sec not in meta["hidden_sections"]:
+                meta["hidden_sections"].append(sec)
+            if c3.button("Up", key=f"up_{idx}", use_container_width=True) and idx > 0:
+                meta["section_order"][idx], meta["section_order"][idx - 1] = meta["section_order"][idx - 1], meta["section_order"][idx]
                 st.rerun()
-            if c3.button("▼", key=f"ord_dn_{idx}") and idx < len(meta["section_order"]) - 1:
-                meta["section_order"][idx], meta["section_order"][idx+1] = meta["section_order"][idx+1], meta["section_order"][idx]
+            if c4.button("Down", key=f"down_{idx}", use_container_width=True) and idx < len(meta["section_order"]) - 1:
+                meta["section_order"][idx], meta["section_order"][idx + 1] = meta["section_order"][idx + 1], meta["section_order"][idx]
                 st.rerun()
 
-    # ── Personal Info ──────────────────────────────────────────────────────
-    with st.expander("👤 Personal Info", expanded=True):
-        p = r["personal"]
-        p["name"]     = st.text_input("Full Name",     value=p["name"],     key="p_name")
-        p["title"]    = st.text_input("Job Title",     value=p["title"],    key="p_title")
-        col1, col2   = st.columns(2)
-        p["email"]    = col1.text_input("Email",       value=p["email"],    key="p_email")
-        p["phone"]    = col2.text_input("Phone",       value=p["phone"],    key="p_phone")
-        p["location"] = st.text_input("Location",      value=p["location"], key="p_location")
-        col3, col4   = st.columns(2)
-        p["linkedin"] = col3.text_input("LinkedIn URL", value=p["linkedin"], key="p_linkedin")
-        p["github"]   = col4.text_input("GitHub URL",   value=p["github"],   key="p_github")
-        p["website"]  = st.text_input("Website",        value=p["website"],  key="p_website")
+html_output = render_html(r)
+encoded = base64.b64encode(html_output.encode()).decode()
 
-    # ── Summary ────────────────────────────────────────────────────────────
-    with st.expander("📝 Summary", expanded=False):
-        r["summary"] = st.text_area("Professional Summary", value=r["summary"], height=130, key="summary", placeholder="Write a short 2-3 line summary...")
-
-    # ── Experience ─────────────────────────────────────────────────────────
-    with st.expander("💼 Work Experience", expanded=False):
-        for i, exp in enumerate(r["experience"]):
-            st.markdown(f"**Entry {i+1}** — {exp['company'] or 'New Entry'}")
-            exp["role"]    = st.text_input("Job Title", value=exp["role"],    key=f"exp_{i}_role")
-            exp["company"] = st.text_input("Company",   value=exp["company"], key=f"exp_{i}_company")
-            exp["location"]= st.text_input("Location",  value=exp["location"],key=f"exp_{i}_location")
-
-            col1, col2 = st.columns(2)
-            exp["start_date"] = date_input_field("Start Date", f"exp_{i}_start", exp["start_date"])
-            exp["current"]    = st.checkbox("Currently working here", value=exp["current"], key=f"exp_{i}_current")
-            if not exp["current"]:
-                exp["end_date"] = date_input_field("End Date", f"exp_{i}_end", exp["end_date"] or exp["start_date"])
-
-            bullets_text = st.text_area("Responsibilities (one per line)", value="\n".join(exp["bullets"]), key=f"exp_{i}_bullets", height=150)
-            exp["bullets"] = [l for l in bullets_text.split("\n") if l.strip()]
-
-            if st.button("🗑 Remove Entry", key=f"exp_{i}_remove"):
-                r["experience"].pop(i); st.rerun()
-            st.markdown("---")
-
-        if st.button("＋ Add Experience", key="add_exp"):
-            r["experience"].append({"role":"","company":"","location":"","start_date":"","end_date":"","current":False,"bullets":[]})
-            st.rerun()
-
-    # ── Education ──────────────────────────────────────────────────────────
-    with st.expander("🎓 Education", expanded=False):
-        for i, edu in enumerate(r["education"]):
-            st.markdown(f"**Entry {i+1}** — {edu['institution'] or 'New Entry'}")
-            edu["institution"] = st.text_input("Institution",    value=edu["institution"], key=f"edu_{i}_inst")
-            edu["degree"]      = st.text_input("Degree",         value=edu["degree"],      key=f"edu_{i}_deg")
-            edu["field"]       = st.text_input("Field of Study",  value=edu["field"],       key=f"edu_{i}_field")
-            edu["grade"]       = st.text_input("Grade / GPA",     value=edu["grade"],       key=f"edu_{i}_grade")
-            edu["start_date"]  = date_input_field("Start Date",  f"edu_{i}_start", edu["start_date"])
-            edu["current"]     = st.checkbox("Currently studying", value=edu["current"],    key=f"edu_{i}_current")
-            if not edu["current"]:
-                edu["end_date"] = date_input_field("End Date",   f"edu_{i}_end", edu["end_date"] or edu["start_date"])
-
-            if st.button("🗑 Remove", key=f"edu_{i}_remove"):
-                r["education"].pop(i); st.rerun()
-            st.markdown("---")
-
-        if st.button("＋ Add Education", key="add_edu"):
-            r["education"].append({"institution":"","degree":"","field":"","grade":"","start_date":"","end_date":"","current":False})
-            st.rerun()
-
-    # ── Skills ─────────────────────────────────────────────────────────────
-    with st.expander("🛠 Skills", expanded=False):
-        for i, sk in enumerate(r["skills"]):
-            if "tags" not in sk or not isinstance(sk["tags"], list):
-                sk["tags"] = []
-            col1, col2 = st.columns([1, 2])
-            sk["category"] = col1.text_input("Category", value=sk["category"], key=f"sk_{i}_cat")
-            items_text  = col2.text_input("Items (comma separated)", value=", ".join(sk.get("tags", [])), key=f"sk_{i}_tags")
-            sk["tags"] = [x.strip() for x in items_text.split(",") if x.strip()]
-            if st.button("🗑 Remove", key=f"sk_{i}_remove"):
-                r["skills"].pop(i); st.rerun()
-
-        if st.button("＋ Add Skill Category", key="add_skill"):
-            r["skills"].append({"category":"","tags":[]})
-            st.rerun()
-
-    # ── Projects ───────────────────────────────────────────────────────────
-    with st.expander("🚀 Projects", expanded=False):
-        for i, proj in enumerate(r["projects"]):
-            st.markdown(f"**Project {i+1}** — {proj['name'] or 'New Project'}")
-            proj["name"]        = st.text_input("Project Name", value=proj["name"],  key=f"pr_{i}_name")
-            proj["link"]        = st.text_input("Link (optional)", value=proj["link"], key=f"pr_{i}_link")
-            tech_text           = st.text_input("Tech Stack (comma separated)", value=", ".join(proj["tech_stack"]), key=f"pr_{i}_tech")
-            proj["tech_stack"]  = [x.strip() for x in tech_text.split(",") if x.strip()]
-            bullets_text        = st.text_area("Details (one per line)", value="\n".join(proj["bullets"]), key=f"pr_{i}_bullets", height=120)
-            proj["bullets"]     = [l for l in bullets_text.split("\n") if l.strip()]
-
-            if st.button("🗑 Remove", key=f"pr_{i}_remove"):
-                r["projects"].pop(i); st.rerun()
-            st.markdown("---")
-
-        if st.button("＋ Add Project", key="add_proj"):
-            r["projects"].append({"name":"","description":"","link":"","tech_stack":[],"bullets":[]})
-            st.rerun()
-
-    # ── Certifications ─────────────────────────────────────────────────────
-    with st.expander("📜 Certifications", expanded=False):
-        for i, cert in enumerate(r["certifications"]):
-            cert["name"]   = st.text_input("Certification Name", value=cert["name"],   key=f"cert_{i}_name")
-            cert["issuer"] = st.text_input("Issuer",             value=cert["issuer"], key=f"cert_{i}_issuer")
-            cert["date"]   = st.text_input("Date (e.g. Jan 2024)", value=cert["date"], key=f"cert_{i}_date")
-            if st.button("🗑 Remove", key=f"cert_{i}_remove"):
-                r["certifications"].pop(i); st.rerun()
-            st.markdown("---")
-
-        if st.button("＋ Add Certification", key="add_cert"):
-            r["certifications"].append({"name":"","issuer":"","date":""})
-            st.rerun()
-
-    # ── Languages ──────────────────────────────────────────────────────────
-    with st.expander("🌐 Languages", expanded=False):
-        for i, lang in enumerate(r["languages"]):
-            col1, col2 = st.columns(2)
-            lang["language"]    = col1.text_input("Language",    value=lang["language"],    key=f"lang_{i}_lang")
-            lang["proficiency"] = col2.text_input("Proficiency", value=lang["proficiency"], key=f"lang_{i}_prof")
-            if st.button("🗑 Remove", key=f"lang_{i}_remove"):
-                r["languages"].pop(i); st.rerun()
-
-        if st.button("＋ Add Language", key="add_lang"):
-            r["languages"].append({"language":"","proficiency":""})
-            st.rerun()
-
-    # ── Volunteering ───────────────────────────────────────────────────────
-    with st.expander("🤝 Volunteering", expanded=False):
-        for i, vol in enumerate(r["volunteering"]):
-            vol["org"]         = st.text_input("Organization", value=vol["org"],         key=f"vol_{i}_org")
-            vol["role"]        = st.text_input("Role",         value=vol["role"],         key=f"vol_{i}_role")
-            vol["date"]        = st.text_input("Date",         value=vol["date"],         key=f"vol_{i}_date")
-            vol["description"] = st.text_area("Description",   value=vol["description"],  key=f"vol_{i}_desc", height=80)
-            if st.button("🗑 Remove", key=f"vol_{i}_remove"):
-                r["volunteering"].pop(i); st.rerun()
-            st.markdown("---")
-
-        if st.button("＋ Add Volunteering", key="add_vol"):
-            r["volunteering"].append({"org":"","role":"","date":"","description":""})
-            st.rerun()
-
-    # ── Reset ──────────────────────────────────────────────────────────────
-    st.markdown("---")
-    if st.button("🔄 Reset to Default", key="reset"):
-        st.session_state.resume = json.loads(json.dumps(DEFAULT_RESUME))
-        st.rerun()
-
-# ══════════════════════════════
-#  RIGHT COLUMN — PREVIEW + EXPORT
-# ══════════════════════════════
 with right_col:
-    st.subheader("Preview")
+    st.subheader("Live Preview")
+    st.caption("Preview updates as you edit and stays close to the exported PDF.")
+    pc1, pc2, pc3 = st.columns(3)
+    if pc1.button("Generate PDF", use_container_width=True, type="primary"):
+        with st.spinner("Generating PDF..."):
+            try:
+                st.session_state.pdf_bytes = generate_pdf(html_output)
+            except Exception as e:
+                st.session_state.pdf_bytes = None
+                st.error(f"PDF generation failed: {e}")
+    pc2.download_button("Download HTML", data=html_output, file_name="resume_preview.html", mime="text/html", use_container_width=True)
+    pc3.download_button("Download JSON", data=json.dumps(r, indent=2), file_name="resume.json", mime="application/json", use_container_width=True)
+    if st.session_state.pdf_bytes:
+        st.download_button("Download PDF", data=st.session_state.pdf_bytes, file_name=f"{(r['personal']['name'] or 'resume').replace(' ', '_')}_resume.pdf", mime="application/pdf", use_container_width=True)
 
-    html_output = render_html(r)
-
-    # Live HTML preview via iframe
-    encoded = base64.b64encode(html_output.encode()).decode()
     iframe_html = f"""
     <iframe
         src="data:text/html;base64,{encoded}"
         width="100%"
-        height="900"
-        style="border: 1px solid #e2e8f0; border-radius: 8px;"
+        height="1060"
+        style="border: 1px solid #dbeafe; border-radius: 16px; background: white;"
         scrolling="yes">
     </iframe>
     """
-    st.components.v1.html(iframe_html, height=920, scrolling=False)
-
-    st.markdown("---")
-
-    # ── Export ──────────────────────────────────────────────────────────
-    col1, col2 = st.columns(2)
-
-    with col1:
-        if st.button("⬇️ Export PDF", key="export_pdf", use_container_width=True):
-            with st.spinner("Generating PDF..."):
-                try:
-                    pdf_bytes = generate_pdf(html_output)
-                    name = r["personal"]["name"].replace(" ", "_") or "resume"
-                    st.download_button(
-                        label="📥 Download PDF",
-                        data=pdf_bytes,
-                        file_name=f"{name}_resume.pdf",
-                        mime="application/pdf",
-                        key="dl_pdf",
-                        use_container_width=True
-                    )
-                except Exception as e:
-                    st.error(f"PDF generation failed: {e}")
-
-    with col2:
-        resume_json = json.dumps(r, indent=2)
-        st.download_button(
-            label="💾 Save as JSON",
-            data=resume_json,
-            file_name="resume.json",
-            mime="application/json",
-            key="dl_json",
-            use_container_width=True
-        )
+    components.html(iframe_html, height=1080, scrolling=True)
