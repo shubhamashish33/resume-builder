@@ -1,0 +1,46 @@
+Features to Implement. 
+
+Input
+- Upload a Markdown / plain text file or fill a structured form
+- Edit content directly in the app (not just upload and done)
+
+Resume Section
+- Personal info (name, title, contact, links)
+- Work Experience
+- Education
+- Skills
+- Optionally: Projects, Certifications, Languages, Volunteering
+
+Output
+
+- Export to PDF — clean, print-ready
+- What you see should closely match what you get (WYSIWYG-ish)
+
+Templates
+
+- At least 2–3 professional templates to choose from
+- Each template should feel distinct (not just color swaps)
+
+Customization
+
+- Change accent color
+- Switch font family
+- Control spacing/density (compact vs spacious)
+- Reorder sections (drag and drop ideally)
+
+
+Nice-to-Have (But Meaningful)
+
+- Live preview as you edit — this is what makes FlowCV feel good
+- Save progress in browser (localStorage) so work isn't lost on refresh
+- ATS-friendly mode — simple single column, no icons or graphics
+- Hide/show individual sections
+- Multiple pages handled gracefully
+
+
+Extra features
+
+- Unlimited PDF exports
+- More than 1–2 templates
+- Custom colors and fonts
+
